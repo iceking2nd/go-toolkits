@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-func getHosts() (map[string][]string, error) {
+func GetHosts() (map[string][]string, error) {
 	bs, err := ioutil.ReadFile(HostsPath)
 	if err != nil {
 		return nil, err
