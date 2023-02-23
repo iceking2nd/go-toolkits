@@ -18,7 +18,7 @@ func TestSliceContains(t *testing.T) {
 	g := []string{"aa", "bb", "cc"}
 	h := []uint64{1}
 	fmt.Println(Contains(g, h))
-	i := []uint64{1, 2, 3}
+	i := []interface{}{1, 2, 3}
 	j := uint64(3)
 	fmt.Println(Contains(i, j))
 }

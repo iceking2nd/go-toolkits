@@ -1,6 +1,6 @@
 module github.com/iceking2nd/go-toolkits
 
-go 1.15
+go 1.20
 
 require (
 	github.com/kbinani/win v0.3.0
