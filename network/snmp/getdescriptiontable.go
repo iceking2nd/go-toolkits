@@ -1,9 +1,10 @@
 package snmp
 
 import (
-	"github.com/soniah/gosnmp"
 	"strings"
 	"time"
+
+	"github.com/gosnmp/gosnmp"
 )
 
 const OID_PREFIX_DESCRIPTION = ".1.3.6.1.2.1.31.1.1.1.18"
