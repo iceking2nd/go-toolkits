@@ -1,5 +1,7 @@
 package trie
 
+import "sync"
+
 type TrieNode struct {
 	children map[rune]*TrieNode
 	isEnd    bool
@@ -7,6 +9,7 @@ type TrieNode struct {
 
 type Trie struct {
 	root *TrieNode
+	mu   sync.RWMutex
 }
 
 func NewTrie() *Trie {
@@ -17,8 +20,11 @@ func NewTrie() *Trie {
 	}
 }
 
-// 插入一个前缀
+// 插入前缀（写锁）
 func (t *Trie) Insert(word string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	node := t.root
 	for _, ch := range word {
 		if node.children[ch] == nil {
@@ -31,8 +37,11 @@ func (t *Trie) Insert(word string) {
 	node.isEnd = true
 }
 
-// 判断字符串是否匹配任意前缀
+// 判断是否匹配任意前缀（读锁）
 func (t *Trie) HasAnyPrefix(s string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	node := t.root
 	for _, ch := range s {
 		node = node.children[ch]
@@ -46,10 +55,14 @@ func (t *Trie) HasAnyPrefix(s string) bool {
 	return false
 }
 
-// 返回匹配到的前缀
+// 返回匹配到的前缀（读锁）
 func (t *Trie) MatchPrefix(s string) (string, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	node := t.root
 	runes := []rune(s)
+
 	for i, ch := range runes {
 		node = node.children[ch]
 		if node == nil {
