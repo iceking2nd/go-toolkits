@@ -1,136 +1,182 @@
+//go:build !darwin
+
 package generator
 
 import (
-	"math/rand"
-	"strings"
-	"time"
+	"crypto/rand"
+	"errors"
+	"io"
+	"math/bits"
+	"sync"
 	"unsafe"
 )
 
-var (
-	letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-	src         = rand.NewSource(time.Now().UnixNano())
-)
+const defaultStringCharset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-const (
-	letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	letterIdxBits = 6                    // 6 bits to represent a letter index
-	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
-	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
-)
+////////////////////////////////////////////////////////
+// Option
+////////////////////////////////////////////////////////
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
+type StringOption func(*StringConfig)
+
+type StringConfig struct {
+	charset string
 }
 
-func RandomString(n int) string {
-	return RandStringBytesMaskImprSrcUnsafe(n)
-}
-
-func RandStringRunes(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+func WithStringCharset(cs string) StringOption {
+	return func(c *StringConfig) {
+		if cs != "" {
+			c.charset = cs
+		}
 	}
-	return string(b)
 }
 
-func RandStringBytes(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letterBytes[rand.Intn(len(letterBytes))]
+func newStringConfig(opts ...StringOption) *StringConfig {
+	cfg := &StringConfig{
+		charset: defaultStringCharset,
 	}
-	return string(b)
-}
-
-func RandStringBytesRmndr(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letterBytes[rand.Int63()%int64(len(letterBytes))]
+	for _, opt := range opts {
+		opt(cfg)
 	}
-	return string(b)
+	return cfg
 }
 
-func RandStringBytesMask(n int) string {
+////////////////////////////////////////////////////////
+// SecureStringGenerator
+////////////////////////////////////////////////////////
+
+type secureStringGenerator struct {
+	charset       string
+	charsetLen    int
+	indexBits     int
+	indexMask     uint64
+	indicesPerInt int
+}
+
+func newSecureStringGenerator(cfg *StringConfig) (*secureStringGenerator, error) {
+	if len(cfg.charset) == 0 {
+		return nil, errors.New("charset cannot be empty")
+	}
+
+	charsetLen := len(cfg.charset)
+
+	indexBits := bits.Len(uint(charsetLen - 1))
+	indexMask := uint64(1<<indexBits - 1)
+	indicesPerInt := 64 / indexBits
+
+	return &secureStringGenerator{
+		charset:       cfg.charset,
+		charsetLen:    charsetLen,
+		indexBits:     indexBits,
+		indexMask:     indexMask,
+		indicesPerInt: indicesPerInt,
+	}, nil
+}
+
+////////////////////////////////////////////////////////
+// Pool (复用 generator + 随机缓冲区)
+////////////////////////////////////////////////////////
+
+type pooledGenerator struct {
+	gen   *secureStringGenerator
+	randB []byte
+}
+
+var generatorPool = sync.Pool{
+	New: func() any {
+		return &pooledGenerator{
+			randB: make([]byte, 4096), // 4KB 批量随机缓存
+		}
+	},
+}
+
+////////////////////////////////////////////////////////
+// 内部核心生成逻辑
+////////////////////////////////////////////////////////
+
+func generateString(n int, unsafeMode bool, opts ...StringOption) (string, error) {
+	if n <= 0 {
+		return "", nil
+	}
+
+	cfg := newStringConfig(opts...)
+	gen, err := newSecureStringGenerator(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	// 从 pool 获取
+	pg := generatorPool.Get().(*pooledGenerator)
+	pg.gen = gen
+
+	defer func() {
+		pg.gen = nil
+		generatorPool.Put(pg)
+	}()
+
 	b := make([]byte, n)
+
+	// 批量填充随机数
+	if _, err := io.ReadFull(rand.Reader, pg.randB); err != nil {
+		return "", err
+	}
+
+	var cache uint64
+	remain := 0
+	randIndex := 0
+	randLen := len(pg.randB)
+
 	for i := 0; i < n; {
-		if idx := int(rand.Int63() & letterIdxMask); idx < len(letterBytes) {
-			b[i] = letterBytes[idx]
+		if remain == 0 {
+			if randIndex+8 > randLen {
+				// 重新填充 buffer
+				if _, err := io.ReadFull(rand.Reader, pg.randB); err != nil {
+					return "", err
+				}
+				randIndex = 0
+			}
+
+			// 使用栈 uint64 组合（方案1）
+			cache = uint64(pg.randB[randIndex]) |
+				uint64(pg.randB[randIndex+1])<<8 |
+				uint64(pg.randB[randIndex+2])<<16 |
+				uint64(pg.randB[randIndex+3])<<24 |
+				uint64(pg.randB[randIndex+4])<<32 |
+				uint64(pg.randB[randIndex+5])<<40 |
+				uint64(pg.randB[randIndex+6])<<48 |
+				uint64(pg.randB[randIndex+7])<<56
+
+			randIndex += 8
+			remain = gen.indicesPerInt
+		}
+
+		idx := int(cache & gen.indexMask)
+		if idx < gen.charsetLen {
+			b[i] = gen.charset[idx]
 			i++
 		}
-	}
-	return string(b)
-}
 
-func RandStringBytesMaskImpr(n int) string {
-	b := make([]byte, n)
-	// A rand.Int63() generates 63 random bits, enough for letterIdxMax letters!
-	for i, cache, remain := n-1, rand.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = rand.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			b[i] = letterBytes[idx]
-			i--
-		}
-		cache >>= letterIdxBits
+		cache >>= gen.indexBits
 		remain--
 	}
 
-	return string(b)
-}
-
-func RandStringBytesMaskImprSrc(n int) string {
-	b := make([]byte, n)
-	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			b[i] = letterBytes[idx]
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
+	if unsafeMode {
+		return *(*string)(unsafe.Pointer(&b)), nil
 	}
 
-	return string(b)
+	return string(b), nil
 }
 
-func RandStringBytesMaskImprSrcSB(n int) string {
-	sb := strings.Builder{}
-	sb.Grow(n)
-	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			sb.WriteByte(letterBytes[idx])
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
-	}
+////////////////////////////////////////////////////////
+// Public API
+////////////////////////////////////////////////////////
 
-	return sb.String()
+// GenerateStringSafe crypto安全 + 内存安全
+func GenerateStringSafe(n int, opts ...StringOption) (string, error) {
+	return generateString(n, false, opts...)
 }
 
-func RandStringBytesMaskImprSrcUnsafe(n int) string {
-	b := make([]byte, n)
-	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			b[i] = letterBytes[idx]
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
-	}
-
-	return *(*string)(unsafe.Pointer(&b))
+// GenerateStringUnsafe crypto安全 + 零拷贝
+func GenerateStringUnsafe(n int, opts ...StringOption) (string, error) {
+	return generateString(n, true, opts...)
 }
